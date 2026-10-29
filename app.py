@@ -1,80 +1,102 @@
 import os, json
-import groq, gradio as gr
+import streamlit as st
+import groq
 from groq import Groq
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-API_KEY = os.environ.get("GROQ_API_KEY")
+st.set_page_config(page_title="DocMind", page_icon="📄", layout="wide")
+
+# ---------- API key + model ----------
+def get_key():
+    try:
+        return st.secrets["GROQ_API_KEY"]
+    except Exception:
+        return os.environ.get("GROQ_API_KEY")
+
+API_KEY = get_key()
 if not API_KEY:
-    raise RuntimeError("GROQ_API_KEY secret set nahi hai (Space Settings -> Secrets).")
+    st.error("GROQ_API_KEY set nahi hai. App Settings → Secrets mein add karein.")
+    st.stop()
 
 client = Groq(api_key=API_KEY)
 
-_ids = [m.id for m in client.models.list().data]
-_prefs = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
-MODEL = next((p for p in _prefs if p in _ids), None)
-if MODEL is None:
-    raise RuntimeError("Koi supported model nahi mila. Available: " + str(_ids))
-print("Using model:", MODEL)
-# USD per 1M tokens (sirf andaza; free tier mein asal kharcha 0). Groq pricing page se check karein:
+@st.cache_resource(show_spinner=False)
+def pick_model():
+    ids = [m.id for m in client.models.list().data]
+    prefs = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
+    return next((p for p in prefs if p in ids), None)
+
+try:
+    MODEL = pick_model()
+except Exception as e:
+    st.error(f"Groq se connect nahi ho paya: {e}")
+    st.stop()
+if not MODEL:
+    st.error("Koi supported Groq model nahi mila.")
+    st.stop()
+
+# USD per 1M tokens, sirf andaza (free tier mein asal kharcha 0)
 PRICE_IN, PRICE_OUT = 0.59, 0.79
 
-STORE = {"chunks": [], "vec": None, "mat": None}
-USAGE = {"in": 0, "out": 0, "calls": 0}
+# ---------- session state ----------
+ss = st.session_state
+ss.setdefault("messages", [])
+ss.setdefault("store", {"chunks": [], "vec": None, "mat": None})
+ss.setdefault("usage", {"in": 0, "out": 0, "calls": 0})
+ss.setdefault("status", "Koi document indexed nahi.")
 
-def read_file(path):
-    if path.lower().endswith(".pdf"):
-        return "\n".join((p.extract_text() or "") for p in PdfReader(path).pages)
-    return open(path, encoding="utf-8", errors="ignore").read()
+# ---------- ingestion + retrieval ----------
+def read_file(f):
+    if f.name.lower().endswith(".pdf"):
+        return "\n".join((p.extract_text() or "") for p in PdfReader(f).pages)
+    return f.getvalue().decode("utf-8", errors="ignore")
 
 def chunk_text(text, size=900, overlap=150):
     text = " ".join(text.split())
     return [text[i:i + size] for i in range(0, len(text), size - overlap) if text[i:i + size].strip()]
 
 def ingest(files):
-    if not files:
-        return "⚠️ Pehle koi PDF/TXT/MD file select karein."
     chunks = []
     try:
         for f in files:
-            path = f if isinstance(f, str) else f.name
-            name = os.path.basename(path)
-            for i, c in enumerate(chunk_text(read_file(path))):
-                chunks.append({"source": name, "id": i, "text": c})
+            for i, c in enumerate(chunk_text(read_file(f))):
+                chunks.append({"source": f.name, "id": i, "text": c})
         if not chunks:
             return "⚠️ Files mein text nahi mila (scanned PDF ho sakta hai)."
         vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
-        STORE.update(chunks=chunks, vec=vec, mat=vec.fit_transform([c["text"] for c in chunks]))
+        ss.store = {"chunks": chunks, "vec": vec, "mat": vec.fit_transform([c["text"] for c in chunks])}
         n = len({c["source"] for c in chunks})
         return f"✅ {n} file(s) index ho gayin, {len(chunks)} chunks."
     except Exception as e:
         return f"❌ Ingestion error: {e}"
 
 def search_documents(query, k=4):
-    if not STORE["chunks"]:
+    st_ = ss.store
+    if not st_["chunks"]:
         return {"error": "Koi document indexed nahi hai."}
-    sims = cosine_similarity(STORE["vec"].transform([query]), STORE["mat"])[0]
+    sims = cosine_similarity(st_["vec"].transform([query]), st_["mat"])[0]
     top = sims.argsort()[::-1][:int(k)]
-    res = [{"source": STORE["chunks"][i]["source"], "chunk_id": STORE["chunks"][i]["id"],
-            "score": round(float(sims[i]), 3), "text": STORE["chunks"][i]["text"]}
+    res = [{"source": st_["chunks"][i]["source"], "chunk_id": st_["chunks"][i]["id"],
+            "score": round(float(sims[i]), 3), "text": st_["chunks"][i]["text"]}
            for i in top if sims[i] > 0]
     return {"results": res} if res else {"results": [], "note": "Kuch relevant nahi mila."}
 
 def list_documents():
-    return {"documents": sorted({c["source"] for c in STORE["chunks"]}), "total_chunks": len(STORE["chunks"])}
+    return {"documents": sorted({c["source"] for c in ss.store["chunks"]}), "total_chunks": len(ss.store["chunks"])}
 
+# ---------- agent ----------
 TOOLS = [
     {"type": "function", "function": {
         "name": "search_documents",
-        "description": "Uploaded documents mein query se relevant passages dhoondta hai. Jawab dene se pehle hamesha use karein.",
+        "description": "Uploaded documents mein query se relevant passages dhoondta hai. Jawab dene se pehle use karein.",
         "parameters": {"type": "object",
                        "properties": {"query": {"type": "string", "description": "Search query"},
                                       "k": {"type": "integer", "description": "Kitne passages (default 4)"}},
                        "required": ["query"]}}},
     {"type": "function", "function": {
-        "name": "list_documents",
-        "description": "Indexed documents ki list deta hai.",
+        "name": "list_documents", "description": "Indexed documents ki list deta hai.",
         "parameters": {"type": "object", "properties": {}}}},
 ]
 
@@ -93,21 +115,16 @@ def run_tool(name, args):
     return {"error": f"Unknown tool {name}"}
 
 def usage_md():
-    cost = USAGE["in"] / 1e6 * PRICE_IN + USAGE["out"] / 1e6 * PRICE_OUT
-    return (f"**📊 Usage**  \nCalls: {USAGE['calls']}  \nInput tokens: {USAGE['in']:,}  \n"
-            f"Output tokens: {USAGE['out']:,}  \nEstimated cost: **${cost:.4f}**")
+    u = ss.usage
+    cost = u["in"] / 1e6 * PRICE_IN + u["out"] / 1e6 * PRICE_OUT
+    return (f"**📊 Usage**  \nCalls: {u['calls']}  \nInput tokens: {u['in']:,}  \n"
+            f"Output tokens: {u['out']:,}  \nEstimated cost: **${cost:.4f}**")
 
-def respond(message, history):
-    history = history or []
-    if not message or not message.strip():
-        yield history, usage_md(); return
-    past = [{"role": m["role"], "content": m["content"]} for m in history
-            if isinstance(m.get("content"), str) and m["role"] in ("user", "assistant")][-10:]   # memory
+def run_agent(message, past):
+    past = [m for m in past if m["role"] in ("user", "assistant")][-10:]   # memory
     while past and past[0]["role"] != "user":
         past.pop(0)
     msgs = [{"role": "system", "content": SYSTEM}] + past + [{"role": "user", "content": message}]
-    history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": "⏳ Soch raha hoon..."}]
-    yield history, usage_md()
     answer, use_tools = "", True
     try:
         for step in range(4):
@@ -115,20 +132,19 @@ def respond(message, history):
             content, calls = "", {}
             try:
                 kwargs = dict(model=MODEL, messages=msgs, max_tokens=1024, temperature=0.2, stream=True)
-                if use_tools and step < 3:   # aakhri round mein tools band, taake jawab zaroor likhe
+                if use_tools and step < 3:
                     kwargs.update(tools=TOOLS, tool_choice="auto")
                 for chunk in client.chat.completions.create(**kwargs):
                     u = getattr(chunk, "usage", None) or getattr(getattr(chunk, "x_groq", None), "usage", None)
                     if u:
-                        USAGE["in"] += u.prompt_tokens; USAGE["out"] += u.completion_tokens; USAGE["calls"] += 1
+                        ss.usage["in"] += u.prompt_tokens; ss.usage["out"] += u.completion_tokens; ss.usage["calls"] += 1
                     if not chunk.choices:
                         continue
                     d = chunk.choices[0].delta
                     if d.content:
                         content += d.content
                         answer = answer_before + content
-                        history[-1]["content"] = answer
-                        yield history, usage_md()
+                        yield answer
                     if d.tool_calls:
                         for tc in d.tool_calls:
                             c = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
@@ -137,8 +153,7 @@ def respond(message, history):
                                 if tc.function.name: c["name"] = tc.function.name
                                 if tc.function.arguments: c["args"] += tc.function.arguments
             except groq.BadRequestError:
-                # Llama kabhi kabhi tool call galat format mein deta hai -> fallback: seedha retrieval
-                if use_tools:
+                if use_tools:   # malformed tool call -> fallback: direct retrieval
                     use_tools, answer = False, answer_before
                     ctx = json.dumps(search_documents(message), ensure_ascii=False)
                     msgs.append({"role": "system", "content": "Tool available nahi. Sirf yeh context use karein:\n" + ctx})
@@ -156,43 +171,60 @@ def respond(message, history):
                 except json.JSONDecodeError:
                     args = {}
                 answer += f"\n\n🔎 _{c['name']}: {json.dumps(args, ensure_ascii=False)}_\n\n"
-                history[-1]["content"] = answer
-                yield history, usage_md()
+                yield answer
                 msgs.append({"role": "tool", "tool_call_id": c["id"],
                              "content": json.dumps(run_tool(c["name"], args), ensure_ascii=False)})
     except groq.AuthenticationError:
-        history[-1]["content"] = "❌ API key ghalat hai. Colab Secrets mein GROQ_API_KEY check karein."
+        yield "❌ API key ghalat hai. Secrets mein GROQ_API_KEY check karein."
     except groq.RateLimitError:
-        history[-1]["content"] = "⏱️ Groq free tier ki rate limit lag gayi. Thori der baad try karein."
+        yield "⏱️ Groq free tier ki rate limit lag gayi. Thori der baad try karein."
     except groq.APIConnectionError:
-        history[-1]["content"] = "🌐 Network masla. Internet check karein."
+        yield "🌐 Network masla. Internet check karein."
     except groq.APIStatusError as e:
-        history[-1]["content"] = f"❌ API error ({e.status_code}): {e.message}"
+        yield f"❌ API error ({e.status_code}): {e.message}"
     except Exception as e:
-        history[-1]["content"] = f"❌ Unexpected error: {e}"
-    yield history, usage_md()
+        yield f"❌ Unexpected error: {e}"
 
-def reset():
-    USAGE.update({"in": 0, "out": 0, "calls": 0})
-    return [], usage_md()
+# ---------- UI ----------
+with st.sidebar:
+    st.header("📄 DocMind")
+    files = st.file_uploader("PDF / TXT / MD upload karein", type=["pdf", "txt", "md"], accept_multiple_files=True)
+    if st.button("📥 Index documents", type="primary", use_container_width=True):
+        if not files:
+            ss.status = "⚠️ Pehle koi file select karein."
+        else:
+            with st.spinner("Indexing..."):
+                ss.status = ingest(files)
+    st.markdown(ss.status)
+    usage_box = st.empty()
+    usage_box.markdown(usage_md())
+    if st.button("🗑️ Chat clear", use_container_width=True):
+        ss.messages = []
+        ss.usage = {"in": 0, "out": 0, "calls": 0}
+        st.rerun()
+    st.caption(f"Model: {MODEL}")
 
-with gr.Blocks(title="DocMind", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 📄 DocMind\nApne documents se sawal poochein. Jawab **citations** ke saath milega.")
-    with gr.Row():
-        with gr.Column(scale=1, min_width=280):
-            files = gr.File(label="PDF / TXT / MD upload karein", file_count="multiple",
-                            file_types=[".pdf", ".txt", ".md"])
-            index_btn = gr.Button("📥 Index documents", variant="primary")
-            status = gr.Markdown("Koi document indexed nahi.")
-            usage = gr.Markdown(usage_md())
-            clear_btn = gr.Button("🗑️ Chat clear")
-        with gr.Column(scale=2, min_width=320):
-            chat = gr.Chatbot(type="messages", height=480, label="Chat")
-            msg = gr.Textbox(placeholder="Sawal likhein aur Enter dabayein...", show_label=False)
-            gr.Examples(["Is document ka khulasa batayein", "Main points kya hain?"], inputs=msg)
-    index_btn.click(ingest, files, status)
-    msg.submit(respond, [msg, chat], [chat, usage]).then(lambda: "", None, msg)
-    clear_btn.click(reset, None, [chat, usage])
+st.title("📄 DocMind")
+st.caption("Apne documents se sawal poochein. Jawab citations ke saath milega.")
 
-if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
+for m in ss.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+if prompt := st.chat_input("Sawal likhein aur Enter dabayein..."):
+    past = list(ss.messages)
+    ss.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    with st.chat_message("assistant"):
+        box = st.empty()
+        box.markdown("⏳ Soch raha hoon...")
+        final = ""
+        for partial in run_agent(prompt, past):
+            final = partial
+            box.markdown(final)
+        if not final.strip():
+            final = "⚠️ Jawab nahi aaya. Dobara try karein."
+            box.markdown(final)
+    ss.messages.append({"role": "assistant", "content": final})
+    usage_box.markdown(usage_md())

@@ -1,4 +1,4 @@
+streamlit
 groq
-gradio>=5,<6
 pypdf
 scikit-learn
