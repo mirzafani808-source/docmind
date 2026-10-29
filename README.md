@@ -2,7 +2,7 @@
 
 Upload PDFs/notes, ask questions, get answers with citations grounded in your documents.
 
-**Live demo:** <Streamlit link yahan daalein>
+**Live demo:** <https://docmind-mcn53vqzj7mxn6e6g5sipd.streamlit.app/>
 
 ## Architecture
 ```
